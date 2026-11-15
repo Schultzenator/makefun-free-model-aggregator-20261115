@@ -200,26 +200,14 @@ export function joinBase(envUrl: string, base: string): string {
 /** The headers a provider wants its key in. */
 export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
   if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
-  return {};
-}
-
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
+  const headerName: Partial<Record<AuthScheme, string>> = {
+    bearer: 'authorization',
+    'x-api-key': 'x-api-key',
+    'x-goog-api-key': 'x-goog-api-key',
+  };
+  const name = headerName[auth];
+  if (name === undefined) return {};
+  return { [name]: auth === 'bearer' ? `Bearer ${key}` : key };
 }
 
 /** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
@@ -241,95 +229,111 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
+function schemaDocuments(text: string): Json[] {
+  const documents: Json[] = [];
+  let cursor = text.indexOf('{');
+  while (cursor !== -1) {
+    const end = objectEnd(text, cursor);
+    if (end === -1) break;
+    const candidate = text.slice(cursor, end + 1);
+    try {
+      const value: unknown = JSON.parse(candidate);
+      if (isRecord(value) && typeof value.schema === 'string') documents.push(value);
+    } catch {
+      // A brace inside prose or an incomplete object is not a document; continue scanning.
+    }
+    cursor = text.indexOf('{', cursor + 1);
+  }
+  return documents;
 }
 
-function numberOrNull(v: unknown): number | null {
-  return finiteNumber(v) ? v : null;
+function stringOf(value: unknown): string {
+  return typeof value === 'string' ? value : '';
 }
 
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
+function numberOrNull(value: unknown): number | null {
+  return finiteNumber(value) ? value : null;
+}
+
+function boolOrNull(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+type FieldReader<T> = (value: unknown) => T | null;
+
+function firstOf<T>(record: Json, keys: readonly string[], read: FieldReader<T>): T | null {
+  for (const key of keys) {
+    const value = read(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
 }
 
 function firstText(record: Json, keys: readonly string[]): string {
-  for (const key of keys) {
-    if (hasString(record[key])) return record[key];
-  }
-  return '';
+  return firstOf(record, keys, (value) => hasString(value) ? value : null) ?? '';
 }
 
 function firstNumber(record: Json, keys: readonly string[]): number | null {
-  for (const key of keys) {
-    const value = numberOrNull(record[key]);
-    if (value !== null) return value;
-  }
-  return null;
+  return firstOf(record, keys, numberOrNull);
 }
 
-function firstBoolean(record: Json, keys: readonly string[]): boolean | null {
-  for (const key of keys) {
-    const value = boolOrNull(record[key]);
-    if (value !== null) return value;
-  }
-  return null;
-}
-
-function providerOf(v: unknown): ProviderDirectoryEntry | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id).trim();
-  const wire = wireOf(v.wire);
+function providerOf(value: unknown): ProviderDirectoryEntry | null {
+  if (!isRecord(value)) return null;
+  const id = stringOf(value.id).trim();
+  const wire = wireOf(value.wire);
   if (id === '' || wire === null) return null;
-  const auth = authOf(v.auth);
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base = firstText(v, ['path', 'base_path', 'base_url', 'base']);
+  const base = firstText(value, ['path', 'base_path', 'base_url', 'base']);
   return {
     id,
-    name: textOr(v.name, id),
+    name: textOr(value.name, id),
     wire,
-    auth,
+    auth: authOf(value.auth),
     base,
-    key_env: stringOf(v.key_env),
-    key: stringOf(v.key),
+    key_env: stringOf(value.key_env),
+    key: stringOf(value.key),
   };
 }
 
-function ratingOf(v: unknown): RatingRow | null {
-  if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
+function ratingOf(value: unknown): RatingRow | null {
+  if (!isRecord(value)) return null;
+  const model = stringOf(value.model);
+  const provider = stringOf(value.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: v.tools === true,
-    vision: v.vision === true,
-    json: v.json === true,
-    free: v.free === true,
+    rating_milli: numberOrNull(value.rating_milli) ?? 0,
+    context_length: numberOrNull(value.context_length),
+    tools: value.tools === true,
+    vision: value.vision === true,
+    json: value.json === true,
+    free: value.free === true,
   };
 }
 
-function workloadRequestOf(v: unknown): WorkloadRequest | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+function requirementOf(value: unknown): Requirement {
+  if (!isRecord(value)) return {};
+  const minContext = numberOrNull(value.min_context);
+  return {
+    tools: value.tools === true,
+    vision: value.vision === true,
+    json: value.json === true,
+    ...(minContext === null ? {} : { min_context: minContext }),
+  };
+}
+
+function workloadRequestOf(value: unknown): WorkloadRequest | null {
+  if (!isRecord(value)) return null;
+  const id = stringOf(value.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  const minContext = numberOrNull(requires.min_context);
   return {
     id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(minContext !== null ? { min_context: minContext } : {}),
-    },
+    api: value.api === 'anthropic' ? 'anthropic' : 'openai',
+    stream: value.stream === true,
+    weight: value.weight === 2 ? 2 : 1,
+    requires: requirementOf(value.requires),
   };
 }
 
@@ -341,28 +345,26 @@ function parseDirectory(document: Json): ProviderDirectoryEntry[] {
   return collect(listOf(document.providers), providerOf);
 }
 
+function bestRow(value: unknown): { id: string; rating_milli: number } | null {
+  if (!isRecord(value) || !hasString(value.id)) return null;
+  return { id: value.id, rating_milli: numberOrNull(value.rating_milli) ?? 0 };
+}
+
 function parseBest(value: unknown): { id: string; rating_milli: number }[] {
-  return collect(listOf(value), (item) => {
-    if (!isRecord(item) || !hasString(item.id)) return null;
-    return { id: item.id, rating_milli: numberOrNull(item.rating_milli) ?? 0 };
-  });
+  return collect(listOf(value), bestRow);
 }
 
 function parseRatings(document: Json | null): RatingsFile | null {
   if (document === null) return null;
-  return {
-    schema: RATINGS_SCHEMA,
-    ratings: collect(listOf(document.ratings), ratingOf),
-    best: parseBest(document.best),
-  };
+  const ratings = collect(listOf(document.ratings), ratingOf);
+  const best = parseBest(document.best);
+  return { schema: RATINGS_SCHEMA, ratings, best };
 }
 
 function parseWorkload(document: Json | null): WorkloadFile | null {
   if (document === null) return null;
-  return {
-    schema: WORKLOAD_SCHEMA,
-    manifest: collect(listOf(document.manifest), workloadRequestOf),
-  };
+  const manifest = collect(listOf(document.manifest), workloadRequestOf);
+  return { schema: WORKLOAD_SCHEMA, manifest };
 }
 
 function emptyBrief(error: string): Brief {
@@ -383,7 +385,7 @@ export function readBrief(path: string): Brief {
   } catch (err) {
     return emptyBrief(`cannot read ${path}: ${(err as Error).message}`);
   }
-  const docs = documentsIn(text);
+  const docs = schemaDocuments(text);
   const directoryDoc = documentWith(PROVIDERS_SCHEMA, docs, (document) => Array.isArray(document.providers));
   if (directoryDoc === null) {
     return emptyBrief(`the brief at ${path} holds no ${PROVIDERS_SCHEMA} document`);
@@ -401,7 +403,10 @@ export function readBrief(path: string): Brief {
 /** The rating row of one provider's model, when the quality table has one. */
 export function ratingOfModel(ratings: RatingsFile | null, providerId: string, modelId: string): RatingRow | null {
   if (ratings === null) return null;
-  return ratings.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
+  for (const row of ratings.ratings) {
+    if (row.provider === providerId && row.model === modelId) return row;
+  }
+  return null;
 }
 
 /**
@@ -409,68 +414,89 @@ export function ratingOfModel(ratings: RatingsFile | null, providerId: string, m
  * listing's own word where it does not, and paid when neither says. A paid model is never routed.
  */
 export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
-  if (row !== null) return row.free;
-  return model.free ?? false;
+  const sealedAnswer = row?.free;
+  if (sealedAnswer !== undefined) return sealedAnswer;
+  return model.free === true;
 }
 
 /** What a model can do: the quality table's row where it has one, the listing's own fields where it does not. */
 export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
+  const chooseNumber = (sealed: number | null, listed: number | null): number | null => sealed ?? listed;
+  const chooseBoolean = (sealed: boolean | null, listed: boolean | null): boolean | null => sealed ?? listed;
   return {
-    context_length: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
+    context_length: chooseNumber(row?.context_length ?? null, model.context_length),
+    tools: chooseBoolean(row?.tools ?? null, model.tools),
+    vision: chooseBoolean(row?.vision ?? null, model.vision),
+    json: chooseBoolean(row?.json ?? null, model.json),
   };
 }
 
 /** Whether a model's capabilities meet one request's requirements. An unknown capability never meets one. */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
+  const booleanRequirements: Array<[boolean | undefined, boolean | null]> = [
+    [requires.tools, caps.tools],
+    [requires.vision, caps.vision],
+    [requires.json, caps.json],
+  ];
+  if (booleanRequirements.some(([needed, available]) => needed === true && available !== true)) return false;
+  const minimum = requires.min_context;
+  return minimum === undefined || (caps.context_length !== null && caps.context_length >= minimum);
 }
 
 /** A price field of a listing: 0 when every price is zero, null when the listing says nothing about price. */
-function zeroPriced(v: Json): boolean | null {
-  const pricing = isRecord(v.pricing) ? v.pricing : null;
+function numericPrice(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function zeroPriced(value: Json): boolean | null {
+  const pricing = isRecord(value.pricing) ? value.pricing : null;
   if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === 'number') return [x];
-    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
-    return [];
-  });
-  if (values.length === 0) return null;
-  return values.every((n) => Number.isFinite(n) && n === 0);
+  const prices = Object.values(pricing).map(numericPrice).filter((price): price is number => price !== null);
+  if (prices.length === 0) return null;
+  return prices.every((price) => price === 0);
 }
 
 /** One model as a listing wrote it, in whichever wire's spelling. */
-function modelIn(wire: Wire, v: unknown): ProbedModel | null {
-  if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
+function modelIn(wire: Wire, value: unknown): ProbedModel | null {
+  if (!isRecord(value)) return null;
+  const id = wire === 'gemini' ? stringOf(value.name).replace(/^models\//, '') : stringOf(value.id);
   if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+  const context = firstNumber(value, ['context_length', 'context_window', 'inputTokenLimit']);
+  const display = firstText(value, ['display_name', 'displayName']) || id;
   return {
     id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
+    display_name: display,
+    free: boolOrNull(value.free) ?? zeroPriced(value),
     context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    tools: boolOrNull(value.tools),
+    vision: boolOrNull(value.vision),
+    json: boolOrNull(value.json),
   };
 }
 
 /** The models one catalog route's answer listed, in its wire's shape. */
-function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
-  if (!isRecord(body)) return [];
-  const list = wire === 'gemini' ? body.models : body.data;
-  return collect(listOf(list), (value) => modelIn(wire, value));
+function modelList(body: Json, wire: Wire): JsonList {
+  return listOf(wire === 'gemini' ? body.models : body.data);
 }
 
+function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
+  if (!isRecord(body)) return [];
+  return collect(modelList(body, wire), (value) => modelIn(wire, value));
+}
+
+const CATALOG_PATH: Record<Wire, string> = {
+  openai: '/v1/models',
+  anthropic: '/v1/models',
+  gemini: '/v1beta/models',
+};
+
 function catalogPath(wire: Wire): string {
-  return wire === 'gemini' ? '/v1beta/models' : '/v1/models';
+  return CATALOG_PATH[wire];
 }
 
 function probeHeaders(provider: ProviderDirectoryEntry): Record<string, string> {
@@ -485,24 +511,54 @@ function failedProbe(provider: ProviderDirectoryEntry, status: number, error: st
 
 function stableModels(models: readonly ProbedModel[]): ProbedModel[] {
   const unique = new Map<string, ProbedModel>();
-  for (const model of [...models].sort((a, b) => a.id.localeCompare(b.id))) {
-    if (!unique.has(model.id)) unique.set(model.id, model);
+  const sorted = [...models].sort((left, right) => left.id.localeCompare(right.id));
+  for (const model of sorted) {
+    if (unique.has(model.id)) continue;
+    unique.set(model.id, model);
   }
   return [...unique.values()];
 }
 
+interface ProbeRequest {
+  url: string;
+  init: RequestInit;
+}
+
+function probeRequest(provider: ProviderDirectoryEntry, envUrl: string, timeoutMs: number): ProbeRequest {
+  return {
+    url: `${joinBase(envUrl, provider.base)}${catalogPath(provider.wire)}`,
+    init: {
+      headers: probeHeaders(provider),
+      signal: AbortSignal.timeout(timeoutMs),
+    },
+  };
+}
+
+function failureMessage(url: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `GET ${url} failed: ${message}`;
+}
+
+async function probeResponse(provider: ProviderDirectoryEntry, request: ProbeRequest): Promise<Probe> {
+  try {
+    const response = await fetch(request.url, request.init);
+    if (!response.ok) return failedProbe(provider, response.status, `GET ${request.url} answered HTTP ${response.status}`);
+    const body: unknown = await response.json();
+    return {
+      provider,
+      ok: true,
+      status: response.status,
+      models: stableModels(modelsIn(provider.wire, body)),
+      error: null,
+    };
+  } catch (error) {
+    return failedProbe(provider, 0, failureMessage(request.url, error));
+  }
+}
+
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = `${base}${catalogPath(provider.wire)}`;
-  try {
-    const res = await fetch(url, { headers: probeHeaders(provider), signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return failedProbe(provider, res.status, `GET ${url} answered HTTP ${res.status}`);
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: stableModels(modelsIn(provider.wire, body)), error: null };
-  } catch (err) {
-    return failedProbe(provider, 0, `GET ${url} failed: ${(err as Error).message}`);
-  }
+  return probeResponse(provider, probeRequest(provider, envUrl, timeoutMs));
 }
 
 /**
@@ -515,20 +571,30 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
  * joined URL does; the joined URL reaches a provider, the path names it.
  */
 export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
+  const providers = successfulProbes(probes).map((probe) => catalogProvider(probe, ratings));
+  return { providers };
+}
+
+function catalogModel(providerId: string, model: ProbedModel, ratings: RatingsFile | null): CatalogModel {
+  const row = ratingOfModel(ratings, providerId, model.id);
   return {
-    providers: probes.filter((probe) => probe.ok).map((probe) => ({
-      id: probe.provider.id,
-      base_url: probe.provider.base,
-      key_env: probe.provider.key_env,
-      wire: probe.provider.wire,
-      models: stableModels(probe.models).map((model) => {
-        const row = ratingOfModel(ratings, probe.provider.id, model.id);
-        return {
-          id: model.id,
-          free: modelFree(model, row),
-          context_length: row?.context_length ?? model.context_length ?? null,
-        };
-      }),
-    })),
+    id: model.id,
+    free: modelFree(model, row),
+    context_length: row?.context_length ?? model.context_length ?? null,
   };
+}
+
+function catalogProvider(probe: Probe, ratings: RatingsFile | null): CatalogProvider {
+  const { provider } = probe;
+  return {
+    id: provider.id,
+    base_url: provider.base,
+    key_env: provider.key_env,
+    wire: provider.wire,
+    models: stableModels(probe.models).map((model) => catalogModel(provider.id, model, ratings)),
+  };
+}
+
+function successfulProbes(probes: readonly Probe[]): Probe[] {
+  return probes.filter((probe) => probe.ok);
 }

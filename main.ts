@@ -168,13 +168,19 @@ function candidateKey(provider: ProviderDirectoryEntry, model: ProbedModel): str
   return `${provider.id}/${model.id}`;
 }
 
+const JSON_RESPONSE_TYPES = new Set(['json_object', 'json_schema']);
+
 function jsonModeOf(body: Json): boolean {
-  return isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
+  const format = body.response_format;
+  return isRecord(format) && typeof format.type === 'string' && JSON_RESPONSE_TYPES.has(format.type);
 }
 
 function requestHasImage(content: unknown): boolean {
   if (!Array.isArray(content)) return false;
-  return content.some((block) => isRecord(block) && (block.type === 'image_url' || block.type === 'image'));
+  for (const block of content) {
+    if (isRecord(block) && (block.type === 'image_url' || block.type === 'image')) return true;
+  }
+  return false;
 }
 
 function normalizeRequest(api: 'openai' | 'anthropic', body: Json, requires: Requirement): RequestShape {
@@ -190,6 +196,15 @@ function candidateFor(probe: Probe, order: number, model: ProbedModel): Candidat
     rating: row?.rating_milli ?? 0,
     key: candidateKey(probe.provider, model),
   };
+}
+
+function probeCanServe(probe: Probe, requires: Requirement, restrictAnthropicWire: boolean): boolean {
+  return probe.ok && !(restrictAnthropicWire && probe.provider.wire === 'anthropic');
+}
+
+function modelCanServe(probe: Probe, model: ProbedModel, requires: Requirement): boolean {
+  const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+  return modelFree(model, row) && meetsRequirements(requires, capabilitiesOf(model, row));
 }
 
 /** This trial's live provider state: successes served, refusal strikes, and a retirement flag. */
@@ -209,26 +224,49 @@ function eligible(requires: Requirement, restrictAnthropicWire: boolean): Candid
   const out: Candidate[] = [];
   for (let index = 0; index < probes.length; index++) {
     const probe = probes[index];
-    if (!probe.ok) continue;
-    if (restrictAnthropicWire && probe.provider.wire === 'anthropic') continue;
+    if (!probeCanServe(probe, requires, restrictAnthropicWire)) continue;
     for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      if (!modelCanServe(probe, model, requires)) continue;
       out.push(candidateFor(probe, index, model));
     }
   }
   return out;
 }
 
-function byPreference(preferredKey: string | null, planned: Map<string, number>, refusedHere: ReadonlySet<string> = new Set()): (a: Candidate, b: Candidate) => number {
-  return (a, b) =>
-    b.rating - a.rating ||
-    (refusedHere.has(a.provider.id) ? 1 : 0) - (refusedHere.has(b.provider.id) ? 1 : 0) ||
-    (a.key === preferredKey ? -1 : 0) + (b.key === preferredKey ? 1 : 0) ||
-    headroom(b, planned) - headroom(a, planned) ||
-    a.order - b.order ||
-    (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0);
+interface RankingContext {
+  preferredKey: string | null;
+  planned: ReadonlyMap<string, number>;
+  refusedHere: ReadonlySet<string>;
+}
+
+function compareProviderHealth(a: Candidate, b: Candidate, refusedHere: ReadonlySet<string>): number {
+  return (refusedHere.has(a.provider.id) ? 1 : 0) - (refusedHere.has(b.provider.id) ? 1 : 0);
+}
+
+function comparePreferred(a: Candidate, b: Candidate, preferredKey: string | null): number {
+  return (a.key === preferredKey ? -1 : 0) + (b.key === preferredKey ? 1 : 0);
+}
+
+function compareStableIds(a: Candidate, b: Candidate): number {
+  return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+}
+
+function compareCandidates(context: RankingContext): (a: Candidate, b: Candidate) => number {
+  return (a, b) => {
+    const byRating = b.rating - a.rating;
+    if (byRating !== 0) return byRating;
+    const byHealth = compareProviderHealth(a, b, context.refusedHere);
+    if (byHealth !== 0) return byHealth;
+    const byPreferred = comparePreferred(a, b, context.preferredKey);
+    if (byPreferred !== 0) return byPreferred;
+    const byHeadroom = headroom(b, context.planned) - headroom(a, context.planned);
+    if (byHeadroom !== 0) return byHeadroom;
+    return a.order - b.order || compareStableIds(a, b);
+  };
+}
+
+function rankCandidates(candidates: readonly Candidate[], context: RankingContext): Candidate[] {
+  return [...candidates].sort(compareCandidates(context));
 }
 
 /**
@@ -249,7 +287,11 @@ function buildPlan(): void {
   for (const { entry, index } of rows) {
     // A JSON-mode OpenAI request carries response_format, which the anthropic wire cannot echo.
     const restrict = entry.api === 'openai' && entry.requires.json === true;
-    const ranked = eligible(entry.requires, restrict).sort(byPreference(null, planned));
+    const ranked = rankCandidates(eligible(entry.requires, restrict), {
+      preferredKey: null,
+      planned,
+      refusedHere: new Set(),
+    });
     const pick = ranked.find((cand) => (planned.get(cand.provider.id) ?? 0) < capOf(cand.provider.id)) ?? ranked[0];
     if (pick === undefined) continue;
     preferred.set(index, pick.key);
@@ -261,9 +303,11 @@ function buildPlan(): void {
 /** Requirements read off a request body, when the manifest has no row for it. */
 function requirementsFromBody(api: 'openai' | 'anthropic', body: Json): Requirement {
   const messages = Array.isArray(body.messages) ? body.messages : [];
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+  const hasVision = messages.some((raw) => isRecord(raw) && raw.role === 'user' && requestHasImage(raw.content));
   return {
-    tools: Array.isArray(body.tools) && body.tools.length > 0,
-    vision: messages.some((raw) => isRecord(raw) && raw.role === 'user' && requestHasImage(raw.content)),
+    tools: hasTools,
+    vision: hasVision,
     json: api === 'openai' && jsonModeOf(body),
   };
 }
@@ -282,20 +326,42 @@ function slotFor(api: 'openai' | 'anthropic', body: Json): { index: number; requ
   return { index, requires: requirementsFromBody(api, body), preferredKey: null };
 }
 
+interface AttemptLedger {
+  tried: Map<string, number>;
+  attempted: string[];
+  refusedHere: Set<string>;
+}
+
+function newAttemptLedger(): AttemptLedger {
+  return { tried: new Map(), attempted: [], refusedHere: new Set() };
+}
+
+function recordAttempt(ledger: AttemptLedger, candidate: Candidate): number {
+  const count = (ledger.tried.get(candidate.key) ?? 0) + 1;
+  ledger.tried.set(candidate.key, count);
+  ledger.attempted.push(candidate.key);
+  return count;
+}
+
+function candidateIsFresh(candidate: Candidate, ledger: AttemptLedger): boolean {
+  return !ledger.tried.has(candidate.key) &&
+    (refusals.get(candidate.provider.id) ?? 0) < 2 &&
+    (successes.get(candidate.provider.id) ?? 0) < capOf(candidate.provider.id);
+}
+
+function candidateCanRescue(candidate: Candidate, ledger: AttemptLedger): boolean {
+  return (ledger.tried.get(candidate.key) ?? 0) < 2 && (refusals.get(candidate.provider.id) ?? 0) < 2;
+}
+
 /** The next candidate to try: the best-ranked one not tried, retired or over its cap; a rescue retry
  *  of an already-tried candidate whose provider is still alive, when no fresh one remains (a refusal
  *  may be one call on a failure schedule, whose neighbour call number serves). */
-function pickCandidate(ranked: readonly Candidate[], tried: ReadonlyMap<string, number>): Candidate | null {
+function pickCandidate(ranked: readonly Candidate[], ledger: AttemptLedger): Candidate | null {
   for (const cand of ranked) {
-    if (tried.has(cand.key)) continue;
-    if ((refusals.get(cand.provider.id) ?? 0) >= 2) continue;
-    if ((successes.get(cand.provider.id) ?? 0) >= capOf(cand.provider.id)) continue;
-    return cand;
+    if (candidateIsFresh(cand, ledger)) return cand;
   }
   for (const cand of ranked) {
-    if ((tried.get(cand.key) ?? 0) >= 2) continue;
-    if ((refusals.get(cand.provider.id) ?? 0) >= 2) continue;
-    return cand;
+    if (candidateCanRescue(cand, ledger)) return cand;
   }
   return null;
 }
@@ -306,22 +372,6 @@ interface ProviderRequest {
   url: string;
   headers: Record<string, string>;
   bodyText: string;
-}
-
-function requestHeaders(provider: ProviderDirectoryEntry): Record<string, string> {
-  return {
-    'content-type': 'application/json',
-    accept: 'application/json, text/event-stream',
-    ...authHeaders(provider.auth, provider.key),
-  };
-}
-
-function providerPath(provider: ProviderDirectoryEntry, api: 'openai' | 'anthropic', stream: boolean, model: string): string {
-  const base = joinBase(ENV_URL, provider.base);
-  if (provider.wire === 'openai') return `${base}/v1/chat/completions`;
-  if (provider.wire === 'anthropic') return `${base}/v1/messages`;
-  const verb = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-  return `${base}/v1beta/models/${encodeURIComponent(model)}:${verb}`;
 }
 
 function providerPayload(cand: Candidate, api: 'openai' | 'anthropic', request: RequestShape): Json {
@@ -338,17 +388,44 @@ function providerPayload(cand: Candidate, api: 'openai' | 'anthropic', request: 
   return request.api === 'openai' ? openAIToGemini(request.body) : anthropicToGemini(request.body);
 }
 
+function providerBaseUrl(provider: ProviderDirectoryEntry): string {
+  return joinBase(ENV_URL, provider.base);
+}
+
+function providerRoute(provider: ProviderDirectoryEntry, model: string, stream: boolean): string {
+  const base = providerBaseUrl(provider);
+  switch (provider.wire) {
+    case 'openai': return `${base}/v1/chat/completions`;
+    case 'anthropic': return `${base}/v1/messages`;
+    case 'gemini': {
+      const operation = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+      return `${base}/v1beta/models/${encodeURIComponent(model)}:${operation}`;
+    }
+  }
+}
+
+function headersForProvider(provider: ProviderDirectoryEntry): Record<string, string> {
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    ...authHeaders(provider.auth, provider.key),
+  };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
+}
+
+function serializedProviderRequest(cand: Candidate, api: 'openai' | 'anthropic', request: RequestShape): ProviderRequest {
+  return {
+    url: providerRoute(cand.provider, cand.model.id, request.stream),
+    headers: headersForProvider(cand.provider),
+    bodyText: JSON.stringify(providerPayload(cand, api, request)),
+  };
+}
+
 /** One inference call, in the routed provider's own wire. */
 function providerRequest(cand: Candidate, api: 'openai' | 'anthropic', body: Json): ProviderRequest {
   const request = normalizeRequest(api, body, requirementsFromBody(api, body));
-  const headers = requestHeaders(cand.provider);
-  if (cand.provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
-  const json = providerPayload(cand, api, request);
-  return {
-    url: providerPath(cand.provider, api, request.stream, cand.model.id),
-    headers,
-    bodyText: JSON.stringify(json),
-  };
+  return serializedProviderRequest(cand, api, request);
 }
 
 /** Release a refused answer's body without reading it as an error. */
@@ -428,61 +505,75 @@ function requestedModel(body: Json, cand: Candidate): string {
   return typeof body.model === 'string' && body.model !== '' ? body.model : cand.model.id;
 }
 
+function sameWire(providerWire: 'openai' | 'anthropic' | 'gemini', clientWire: 'openai' | 'anthropic'): boolean {
+  return providerWire === clientWire;
+}
+
+function writeUpstreamBody(upstream: Response, res: ServerResponse): Promise<void> {
+  return upstream.text().then((text) => {
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(text);
+  });
+}
+
+async function relaySameWire(body: Json, upstream: Response, res: ServerResponse): Promise<boolean> {
+  if (body.stream !== true) {
+    await writeUpstreamBody(upstream, res);
+    return true;
+  }
+  if (upstream.body === null) return false;
+  sseHeaders(res);
+  await pipeStream(upstream.body, res);
+  return true;
+}
+
+function neutralResponse(wire: 'openai' | 'anthropic' | 'gemini', parsed: unknown): ReturnType<typeof neutralOfOpenAI> {
+  if (!isRecord(parsed)) return null;
+  if (wire === 'openai') return neutralOfOpenAI(parsed);
+  if (wire === 'anthropic') return neutralOfAnthropic(parsed);
+  return neutralOfGemini(parsed);
+}
+
+async function relayJson(api: 'openai' | 'anthropic', wire: 'openai' | 'anthropic' | 'gemini', model: string, upstream: Response, res: ServerResponse): Promise<void> {
+  const neutral = neutralResponse(wire, await upstream.json());
+  if (neutral === null) {
+    sendError(res, api, 502, api === 'anthropic' ? 'api_error' : 'upstream_error', 'the provider answered a body this server could not translate');
+    return;
+  }
+  const answer = api === 'openai' ? neutralToOpenAI(neutral, model) : neutralToAnthropic(neutral, model);
+  sendJson(res, 200, answer);
+}
+
+function neutralStream(wire: 'openai' | 'anthropic' | 'gemini', body: ReadableStream<Uint8Array>) {
+  if (wire === 'openai') return openAIStreamToNeutral(body);
+  if (wire === 'anthropic') return anthropicStreamToNeutral(body);
+  return geminiStreamToNeutral(body);
+}
+
+async function relayStream(api: 'openai' | 'anthropic', wire: 'openai' | 'anthropic' | 'gemini', model: string, body: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
+  const neutral = neutralStream(wire, body);
+  const rendered = api === 'openai' ? renderOpenAIStream(neutral, model) : renderAnthropicStream(neutral, model);
+  sseHeaders(res);
+  for await (const chunk of rendered) res.write(chunk);
+  res.end();
+}
+
 /** Relay a provider's 2xx answer to the client in the client's own wire, JSON or SSE. */
 async function relay(cand: Candidate, api: 'openai' | 'anthropic', body: Json, upstream: Response, res: ServerResponse): Promise<void> {
   const stream = body.stream === true;
   const wire = cand.provider.wire;
   const model = requestedModel(body, cand);
 
-  // The same wire needs no translation: the provider's answer is already the client's shape.
-  if ((wire === 'openai' && api === 'openai') || (wire === 'anthropic' && api === 'anthropic')) {
-    if (stream && upstream.body !== null) {
-      sseHeaders(res);
-      await pipeStream(upstream.body, res);
-      return;
-    }
-    const text = await upstream.text();
-    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-    res.end(text);
+  if (sameWire(wire, api)) {
+    if (!await relaySameWire(body, upstream, res)) sendError(res, api, 500, 'api_error', 'the provider answered no stream');
     return;
   }
-
-  if (stream && upstream.body === null) {
-    sendError(res, api, 500, 'api_error', 'the provider answered no stream');
+  if (stream) {
+    if (upstream.body === null) sendError(res, api, 500, 'api_error', 'the provider answered no stream');
+    else await relayStream(api, wire, model, upstream.body, res);
     return;
   }
-
-  if (!stream) {
-    const parsed: unknown = await upstream.json();
-    const neutral = isRecord(parsed)
-      ? wire === 'openai'
-        ? neutralOfOpenAI(parsed)
-        : wire === 'anthropic'
-          ? neutralOfAnthropic(parsed)
-          : neutralOfGemini(parsed)
-      : null;
-    if (neutral === null) {
-      sendError(res, api, 502, api === 'anthropic' ? 'api_error' : 'upstream_error', 'the provider answered a body this server could not translate');
-      return;
-    }
-    sendJson(res, 200, api === 'openai' ? neutralToOpenAI(neutral, model) : neutralToAnthropic(neutral, model));
-    return;
-  }
-
-  // A streamed answer across wires: the provider's events to neutral deltas, then the client's shape.
-  sseHeaders(res);
-  const upstreamBody = upstream.body!;
-  if (wire === 'openai') {
-    const render = api === 'anthropic' ? renderAnthropicStream(openAIStreamToNeutral(upstreamBody), model) : renderOpenAIStream(openAIStreamToNeutral(upstreamBody), model);
-    for await (const chunk of render) res.write(chunk);
-  } else if (wire === 'anthropic') {
-    const render = api === 'openai' ? renderOpenAIStream(anthropicStreamToNeutral(upstreamBody), model) : renderAnthropicStream(anthropicStreamToNeutral(upstreamBody), model);
-    for await (const chunk of render) res.write(chunk);
-  } else {
-    const render = api === 'openai' ? renderOpenAIStream(geminiStreamToNeutral(upstreamBody), model) : renderAnthropicStream(geminiStreamToNeutral(upstreamBody), model);
-    for await (const chunk of render) res.write(chunk);
-  }
-  res.end();
+  await relayJson(api, wire, model, upstream, res);
 }
 
 // ---------------------------------------------------------------- the request handlers
@@ -521,26 +612,50 @@ function isRoute(method: string | undefined, actual: string | undefined, expecte
   return method === expectedMethod && actual === expectedPath;
 }
 
+type ClientApi = 'openai' | 'anthropic';
+
+interface Route {
+  method: string;
+  path: string;
+  api: ClientApi;
+  action: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
+}
+
+function invalidBody(res: ServerResponse, api: ClientApi): void {
+  sendError(res, api, 400, 'invalid_request_error', 'the request body is not one JSON object');
+}
+
+async function serveBody(api: ClientApi, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson(req);
+  if (body === null) {
+    invalidBody(res, api);
+    return;
+  }
+  await serve(api, body, res);
+}
+
 /** POST /v1/chat/completions and POST /v1/messages: route, call, fail over, answer in the client's wire. */
 async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const slot = slotFor(api, body);
   const clientJson = api === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
   const ranked = eligible(slot.requires, clientJson);
-  const tried = new Map<string, number>();
-  const attempted: string[] = [];
-  const refusedHere = new Set<string>();
+  const ledger = newAttemptLedger();
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const cand = pickCandidate([...ranked].sort(byPreference(slot.preferredKey, successes, refusedHere)), tried);
+    const ordered = rankCandidates(ranked, {
+      preferredKey: slot.preferredKey,
+      planned: successes,
+      refusedHere: ledger.refusedHere,
+    });
+    const cand = pickCandidate(ordered, ledger);
     if (cand === null) break;
-    tried.set(cand.key, (tried.get(cand.key) ?? 0) + 1);
-    attempted.push(cand.key);
-    log(`slot ${slot.index} attempt ${attempt + 1}: ${cand.key}`);
+    const attemptNumber = recordAttempt(ledger, cand);
+    log(`slot ${slot.index} attempt ${attemptNumber}: ${cand.key}`);
     const upstream = await callProvider(cand, api, body);
     if (upstream === null) continue;
     const decision = classifyUpstream(upstream.status);
     if (decision === 'retry') {
-      markRefusal(cand, refusedHere);
+      markRefusal(cand, ledger.refusedHere);
       log(`refused by ${cand.key} with ${upstream.status}`);
       await drain(upstream);
       continue;
@@ -555,7 +670,7 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
     return;
   }
 
-  log(`no candidate served this request (tried ${attempted.join(', ') || 'nothing'})`);
+  log(`no candidate served this request (tried ${ledger.attempted.join(', ') || 'nothing'})`);
   sendError(res, api, api === 'anthropic' ? 503 : 503, api === 'anthropic' ? 'overloaded_error' : 'service_unavailable', 'no free provider on the directory could serve this request');
 }
 
@@ -568,23 +683,20 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
-  if (isRoute(req.method, url.pathname, 'GET', '/v1/models')) {
-    models(req, res);
-    return;
-  }
-  if (isRoute(req.method, url.pathname, 'POST', '/v1/chat/completions')) {
-    const body = await readJson(req);
-    if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-    await serve('openai', body, res);
-    return;
-  }
-  if (isRoute(req.method, url.pathname, 'POST', '/v1/messages')) {
-    const body = await readJson(req);
-    if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-    await serve('anthropic', body, res);
+  const route = routes().find((entry) => isRoute(req.method, url.pathname, entry.method, entry.path));
+  if (route !== undefined) {
+    await route.action(req, res);
     return;
   }
   sendError(res, clientWireFor(url.pathname), 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+}
+
+function routes(): Route[] {
+  return [
+    { method: 'GET', path: '/v1/models', api: 'openai', action: (req, res) => models(req, res) },
+    { method: 'POST', path: '/v1/chat/completions', api: 'openai', action: (req, res) => serveBody('openai', req, res) },
+    { method: 'POST', path: '/v1/messages', api: 'anthropic', action: (req, res) => serveBody('anthropic', req, res) },
+  ];
 }
 
 // ---------------------------------------------------------------- startup
@@ -601,12 +713,7 @@ async function register(port: number, report: CatalogReport): Promise<void> {
   const request = { protocol_version: PROTOCOL_VERSION, port, catalog: report };
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(request),
-        signal: AbortSignal.timeout(5000),
-      });
+      const res = await postRegistration(request);
       await acceptRegistration(res);
       return;
     } catch (err) {
@@ -614,6 +721,15 @@ async function register(port: number, report: CatalogReport): Promise<void> {
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
     }
   }
+}
+
+function postRegistration(request: { protocol_version: number; port: number; catalog: CatalogReport }): Promise<Response> {
+  return fetch(`${ENV_URL}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(5000),
+  });
 }
 
 async function acceptRegistration(res: Response): Promise<void> {
@@ -627,7 +743,7 @@ async function acceptRegistration(res: Response): Promise<void> {
 async function workIsDone(): Promise<boolean> {
   try {
     const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-    if (res.status !== 200) return false;
+    if (!res.ok) return false;
     const work: unknown = await res.json();
     return isRecord(work) && work.done === true;
   } catch {
@@ -635,25 +751,29 @@ async function workIsDone(): Promise<boolean> {
   }
 }
 
+function stopServer(timer: NodeJS.Timeout, server: Server): void {
+  clearInterval(timer);
+  server.close();
+  process.exit(0);
+}
+
+async function pollOnce(timer: NodeJS.Timeout, server: Server, state: { inFlight: boolean }): Promise<void> {
+  if (state.inFlight) return;
+  state.inFlight = true;
+  try {
+    if (await workIsDone()) stopServer(timer, server);
+  } finally {
+    state.inFlight = false;
+  }
+}
+
 /** Poll GET /work every 100 ms; exit 0 the moment it says done. */
 function poll(server: Server): void {
-  let inFlight = false;
+  const state = { inFlight: false };
   const timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    void (async () => {
-      try {
-        if (await workIsDone()) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
-        }
-      } catch {
-        // The env is not reachable yet: try again on the next tick.
-      } finally {
-        inFlight = false;
-      }
-    })();
+    void pollOnce(timer, server, state).catch(() => {
+      // The env is not reachable yet: try again on the next tick.
+    });
   }, POLL_INTERVAL_MS);
 }
 
