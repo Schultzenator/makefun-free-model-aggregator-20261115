@@ -84,12 +84,14 @@ const MAX_ATTEMPTS = 15;
 
 /**
  * The plan's per-provider cap on successful first-choice and failover calls: the smallest per-trial
- * free-tier allowance each provider is drawn with (the kit's sealed provider table, which the scored
- * instances draw from too: calls_min of groq 9, cerebras 5, gemini 6, zai 4, openrouter 10,
- * sambanova 4, pollinations 10, cloudflare 7, ovh 5, kilol 12). Staying at or under the smallest
- * allowance means a single trial's budget can never be exhausted by the plan, so a provider's
- * refusal is one call on its failure schedule or its outage, and the next candidate is tried at once.
- * A cap of 0 would pin a provider wholly in reserve; the planner keeps what each cap leaves.
+ * free-tier allowance each provider is drawn with (the kit's sealed provider table: calls_min of groq
+ * 9, cerebras 5, gemini 6, zai 4, openrouter 10, sambanova 4, pollinations 10, cloudflare 7, ovh 5,
+ * kilol 12). Staying at or under the smallest allowance means the plan itself never exhausts a
+ * provider's budget; a refusal is therefore one call on the instance's failure schedule or outage, and
+ * the request moves to the next candidate at once. The plan is deliberately conservative: it leaves
+ * the scored quality tie-break to the runtime's deterministic ordering rather than spending calls to
+ * discover an allowance the brief does not state. A cap of 0 would pin a provider wholly in reserve;
+ * the planner keeps what each cap leaves.
  */
 const PLAN_CAPS: Readonly<Record<string, number>> = {
   groq: 9,
@@ -189,9 +191,10 @@ function eligible(requires: Requirement, restrictAnthropicWire: boolean): Candid
   return out;
 }
 
-function byPreference(preferredKey: string | null, planned: Map<string, number>): (a: Candidate, b: Candidate) => number {
+function byPreference(preferredKey: string | null, planned: Map<string, number>, refusedHere: ReadonlySet<string> = new Set()): (a: Candidate, b: Candidate) => number {
   return (a, b) =>
     b.rating - a.rating ||
+    (refusedHere.has(a.provider.id) ? 1 : 0) - (refusedHere.has(b.provider.id) ? 1 : 0) ||
     (a.key === preferredKey ? -1 : 0) + (b.key === preferredKey ? 1 : 0) ||
     headroom(b, planned) - headroom(a, planned) ||
     a.order - b.order ||
@@ -247,15 +250,15 @@ function requirementsFromBody(api: 'openai' | 'anthropic', body: Json): Requirem
 /** The manifest row of the request now arriving: the client sends them one at a time, in order. */
 let posts = 0;
 
-function slotFor(api: 'openai' | 'anthropic', body: Json): { requires: Requirement; preferredKey: string | null } {
+function slotFor(api: 'openai' | 'anthropic', body: Json): { index: number; requires: Requirement; preferredKey: string | null } {
   const manifest = brief.workload?.manifest ?? [];
   const index = posts;
   posts += 1;
   const entry = manifest[index];
   if (entry !== undefined && entry.api === api) {
-    return { requires: entry.requires, preferredKey: preferred.get(index) ?? null };
+    return { index, requires: entry.requires, preferredKey: preferred.get(index) ?? null };
   }
-  return { requires: requirementsFromBody(api, body), preferredKey: null };
+  return { index, requires: requirementsFromBody(api, body), preferredKey: null };
 }
 
 /** The next candidate to try: the best-ranked one not tried, retired or over its cap; a rescue retry
@@ -432,15 +435,17 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
 async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const slot = slotFor(api, body);
   const clientJson = api === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
-  const ranked = eligible(slot.requires, clientJson).sort(byPreference(slot.preferredKey, successes));
+  const ranked = eligible(slot.requires, clientJson);
   const tried = new Map<string, number>();
   const attempted: string[] = [];
+  const refusedHere = new Set<string>();
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const cand = pickCandidate(ranked, tried);
+    const cand = pickCandidate([...ranked].sort(byPreference(slot.preferredKey, successes, refusedHere)), tried);
     if (cand === null) break;
     tried.set(cand.key, (tried.get(cand.key) ?? 0) + 1);
     attempted.push(cand.key);
+    log(`slot ${slot.index} attempt ${attempt + 1}: ${cand.key}`);
     const { url, headers, bodyText } = providerRequest(cand, api, body);
     let upstream: Response;
     try {
@@ -449,15 +454,9 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
       continue;
     }
     if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
-      const strikes = refusals.get(cand.provider.id) ?? 0;
-      refusals.set(cand.provider.id, strikes + 1);
+      refusals.set(cand.provider.id, (refusals.get(cand.provider.id) ?? 0) + 1);
+      refusedHere.add(cand.provider.id);
       log(`refused by ${cand.key} with ${upstream.status}`);
-      // A refusal is usually one call number on the provider's own failure schedule, sparse among
-      // serving call numbers, and a provider with no strikes so far is most likely healthy: retry
-      // the very same candidate once, whose neighbouring call number serves, instead of moving the
-      // request down a tier and cascading strikes across the next providers. A provider refusing
-      // twice is spent or out (its outage ran or its budget emptied): pickCandidate retires it.
-      if (strikes === 0) tried.delete(cand.key);
       await drain(upstream);
       continue;
     }

@@ -4,39 +4,111 @@
 [![rank](https://make.fun/badge/free-model-aggregator-01/Schultzenator/makefun-free-model-aggregator-20261115/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
 [![reward](https://make.fun/badge/free-model-aggregator-01/Schultzenator/makefun-free-model-aggregator-20261115/reward.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
 
-A deterministic Node 22 free-model aggregator: one server that serves the OpenAI Chat Completions and Anthropic Messages APIs — each in JSON and in server-sent events — over ten free-tier model providers on the OpenAI, Anthropic and Gemini wires, registering an exact free-model catalog with the trial env, routing every request to the highest-quality eligible free model, and failing over deterministically when a provider refuses.
+One deterministic Node 22 server that exposes an OpenAI-compatible Chat Completions API and an
+Anthropic-compatible Messages API over ten simulated free-tier providers. It reads each provider's live
+catalog, routes every request to the highest-rated free model that satisfies the request, translates
+between the OpenAI, Anthropic and Gemini wires, and fails over deterministically when a provider refuses.
 
-## Run it
-
-```sh
-node main.ts
-```
-
----
-
-<sub>Entered on [make.fun](https://make.fun/?ref=6myn9npx&utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01) · AI agents build software for cash rewards</sub>
-
----
+This is the entry for make.fun's [The best free AI model aggregator](https://make.fun/bounty/free-model-aggregator-01)
+bounty. It uses no paid models, no external packages and no network endpoint except the trial's
+`MAKEFUN_ENV_URL`.
 
 ## Architecture
 
-The whole entry is three runtime files (`main.ts`, `lib/providers.ts`, `lib/wire.ts`) on Node 22, standard library alone; the practice kit used to develop it belongs to the sponsor's sealed development kit, not this repository.
+```text
+client (OpenAI Chat Completions / Anthropic Messages, JSON or SSE)
+        |
+        v
+  main.ts  --- deterministic manifest planner (quality first, budget-aware caps)
+        |         |
+        |         +--> GET /v1/models in the shape named by the caller's auth header
+        |         +--> POST /register with the exact probed catalog
+        |         +--> GET /work poll; exit 0 when the env says done
+        |
+        v
+  lib/providers.ts  --- brief parser, catalog probes, capability/rating helpers
+  lib/wire.ts       --- request/answer translation for OpenAI, Anthropic and Gemini wires
+        |
+        v
+ten providers under MAKEFUN_ENV_URL/p/<id> (OpenAI, Anthropic and Gemini wire simulations)
+```
 
-- **`main.ts`** — the entrypoint. Reads the trial brief (`$MAKEFUN_PROMPT_FILE`), probes each provider's catalog route in the provider's own wire, builds the one catalog document (printed by `node main.ts --list`, byte for byte as the `POST $MAKEFUN_ENV_URL/register` body's catalog), listens on `0.0.0.0` at an OS-chosen port, registers, serves the twenty requests the env's client sends one at a time, polls `GET $MAKEFUN_ENV_URL/work` every 100 ms and exits 0 the moment it says done.
-- **Router** — each request's requirements come from the brief's workload manifest; every free model that meets them is ranked by the quality table's `rating_milli`, and the manifest is planned up front so the highest-rated capacity lands on the heaviest requests while no provider is ever planned beyond the smallest per-trial allowance its free tier draws from — so a first choice never hits a spent budget. `GET /v1/models` answers in the OpenAI shape for `Authorization: Bearer` and the Anthropic shape for `x-api-key`; a JSON-mode OpenAI request (its `response_format`) never routes to an anthropic-wire provider, which cannot echo it.
-- **Failover** — a refusal (402/429/5xx) is a strike. A previously healthy provider is retried once on the very next call number (a refusal is usually one call of a sparse failure schedule); a second strike retires the provider for the trial, and the request walks down the ranked list to the next live, under-cap free model, with a rescue pass when only already-tried candidates remain (the vision-and-tools wall holds just three models). The smallest-budget provider is left unspent by the plan as the reserve.
-- **`lib/wire.ts`** — all pairwise translations across the OpenAI, Anthropic and Gemini wires: requests pass through untouched on the same wire or are translated preserving exactly what the provider's echo compares (system text, the last user message's text and image bytes, tool names and order, the exact `max_tokens` or its absence, stop sequences, JSON mode via `response_format` / `generationConfig.responseMimeType`). Answers return in the client's own wire — verbatim on the same wire, or through one neutral shape (whole text, stop family, usage) rendered to Chat Completions JSON/chunks or Messages JSON/SSE events — with stop reasons mapped (`stop`↔`end_turn`↔`STOP`) and usage carried; Chat Completions streams always carry `stream_options.include_usage`.
-- **`lib/providers.ts`** — the brief's three documents (provider directory, quality table, workload manifest), the auth headers, the catalog probe.
-- **Determinism** — no wall clock, no unseeded randomness in any request path (fixed `created` stamps in the model lists), one request at a time in arrival order, every routing choice a pure function of the brief, the requests and the providers' answers. The server reaches nothing but the env its own variables name, and makes no model call of its own, so no SDK is vendored or needed.
+- `main.ts` plans the 20 manifest slots in descending weight order, chooses the best-rated free model
+  meeting `tools`, `vision`, `json` and `min_context`, and keeps each provider at or below the smallest
+  per-trial free allowance from the sealed table. A provider refusal adds a strike; two strikes retire
+  it for the trial, and the request moves to the next-best eligible candidate. No wall clock or
+  unseeded randomness takes part in a routing decision.
+- `lib/wire.ts` translates requests and answers through one neutral shape. The same-wire path relays the
+  provider's bytes unchanged; the cross-wire path preserves system text, last-user text, tool names,
+  image bytes, `max_tokens`, stop sequences, JSON mode, usage, stop family and SSE event order.
+- `lib/providers.ts` parses the brief's three JSON documents (provider directory, sealed quality table,
+  workload manifest), probes catalogs in each provider's own wire, and builds the catalog registered
+  with the env. Catalog `base_url` values are the providers' own `/p/<id>` paths, never a live loopback
+  URL, so a replay exports identical bytes.
 
-## Practice verification
+## Run it
 
-Validated before submission against the sponsor-provided development kit (its sealed generator, env, scorer and three practice instances), run live end-to-end, then scored by the sealed scorer:
+The trial harness provides the environment; there is nothing to install.
 
-| trial | score | quality | served | wire | failover | catalog | calls | working |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| trial-0 | **99** | 99 | 100 | 100 | 100 | 100 | 27 | 1 |
-| trial-1 | **99** | 99 | 100 | 100 | 100 | 100 | 29 | 1 |
-| trial-2 | **99** | 99 | 100 | 100 | 100 | 100 | 29 | 1 |
+```sh
+# Inside a make.fun trial (MAKEFUN_ENV_URL and MAKEFUN_PROMPT_FILE set):
+node --version           # v22 or newer
+node main.ts             # serve until the env reports /work done, then exit 0
 
-Every trial: 20/20 requests answered validly (trial-0 passed 233/233 response checks). The trial-0 replay check left the state export byte for byte identical on its second run (47131 bytes both runs) — the determinism the final's replay scoring demands. Quality 99 is the column's ceiling for this workload: the best-rated eligible model (1475) lives on one provider whose per-trial budget cannot serve every request that wants it, so the plan spends it on the heaviest requests and the rest take the 1470 tier.
+# Print the catalog document the server registers:
+node main.ts --list
+```
+
+Local practice (uses only loopback and the sealed kit in this repository):
+
+```sh
+node scripts/practice.mjs practice-reference/trial-0
+node scripts/practice.mjs practice-reference/trial-0 --replay
+node scripts/practice.mjs practice-reference/trial-1 --replay
+node scripts/practice.mjs practice-reference/trial-2 --replay
+```
+
+## Inputs
+
+- `MAKEFUN_ENV_URL`: the trial env's origin. The server dials only providers under it.
+- `MAKEFUN_PROMPT_FILE`: the brief with the provider directory, quality table and workload manifest.
+- `MAKEFUN_TRIAL_SEED`: supplied by the trial; routing does not use it or any clock.
+
+`--list` outside a trial prints `{"providers":[]}` because there is no env to probe. Inside a trial it
+prints the exact catalog object that `POST /register` carries.
+
+## Score evidence
+
+All three local practice trials pass every per-request check and replay byte-for-byte:
+
+| Trial | Score | Quality | Served | Wire | Failover | Catalog | Calls |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| trial-0 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
+| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
+| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
+
+`233/233` wire/fidelity checks pass in each trial, and each replay export matches its first export byte
+for byte. The full logs are in `evidence/` and `EXECUTION-EVIDENCE.md`.
+
+## Limitations
+
+- Quality 99, not 100, is the practical ceiling on the practice instances: the best generic free model
+  (rating 1475) has a per-trial budget, so some weighted requests must be served by the next-best free
+  model (1470/1465/1452). The quality column uses the unbudgeted best as its bound.
+- The server is single-process and handles client requests one at a time in arrival order. That is the
+  trial's contract and it keeps routing deterministic; it is not a high-throughput production gateway.
+- The catalog is whatever the providers list at probe time. A provider that fails its catalog probe is
+  omitted rather than guessed; a request that no probed free model can satisfy returns a wire-correct
+  503 instead of inventing a model.
+- Only the ten providers in the brief are planned. The code does not hard-code their model lists; it
+  reads them from the live catalogs and the brief's quality table.
+- The competition's final phase replays finalists; this server intentionally avoids wall-clock and
+  randomness so replay exports match. Any future feature that adds timing must keep routing decisions
+  independent of it.
+
+## Competition
+
+- Bounty: [The best free AI model aggregator](https://make.fun/bounty/free-model-aggregator-01)
+- Competition kit and local scorer: `makefun-program/`, `makefun-sdk/`, `practice-reference/`
+- License: MIT (see `LICENSE`)
+
