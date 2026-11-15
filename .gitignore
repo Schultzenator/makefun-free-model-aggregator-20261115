@@ -1,0 +1,9 @@
+# Local practice-harness outputs (state exports, scores, replays): never part of the entry
+.practice/
+
+# Node
+node_modules/
+
+# Editor / OS transient files
+*.log
+.DS_Store
