@@ -39,6 +39,45 @@ export const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
 export type Json = Record<string, unknown>;
 export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+type JsonList = readonly unknown[];
+type DocumentPredicate = (document: Json) => boolean;
+
+const WIRES: readonly Wire[] = ['openai', 'anthropic', 'gemini'];
+const AUTH_SCHEMES: readonly AuthScheme[] = ['bearer', 'x-api-key', 'x-goog-api-key', 'none'];
+
+function hasString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function textOr(value: unknown, fallback: string): string {
+  return hasString(value) ? value : fallback;
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function listOf(value: unknown): JsonList {
+  return Array.isArray(value) ? value : [];
+}
+
+function collect<T>(values: JsonList, decode: (value: unknown) => T | null): T[] {
+  const result: T[] = [];
+  for (const value of values) {
+    const decoded = decode(value);
+    if (decoded !== null) result.push(decoded);
+  }
+  return result;
+}
+
+function wireOf(value: unknown): Wire | null {
+  return typeof value === 'string' && (WIRES as readonly string[]).includes(value) ? value as Wire : null;
+}
+
+function authOf(value: unknown): AuthScheme {
+  return typeof value === 'string' && (AUTH_SCHEMES as readonly string[]).includes(value) ? value as AuthScheme : 'bearer';
+}
+
 /** One provider as the brief lists it. `base` is the base path (or absolute URL) its routes hang off. */
 export interface ProviderDirectoryEntry {
   id: string;
@@ -207,24 +246,54 @@ function stringOf(v: unknown): string {
 }
 
 function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  return finiteNumber(v) ? v : null;
 }
 
 function boolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
+function firstText(record: Json, keys: readonly string[]): string {
+  for (const key of keys) {
+    if (hasString(record[key])) return record[key];
+  }
+  return '';
+}
+
+function firstNumber(record: Json, keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const value = numberOrNull(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function firstBoolean(record: Json, keys: readonly string[]): boolean | null {
+  for (const key of keys) {
+    const value = boolOrNull(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
 function providerOf(v: unknown): ProviderDirectoryEntry | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
+  const id = stringOf(v.id).trim();
+  const wire = wireOf(v.wire);
   if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
+  const auth = authOf(v.auth);
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+  const base = firstText(v, ['path', 'base_path', 'base_url', 'base']);
+  return {
+    id,
+    name: textOr(v.name, id),
+    wire,
+    auth,
+    base,
+    key_env: stringOf(v.key_env),
+    key: stringOf(v.key),
+  };
 }
 
 function ratingOf(v: unknown): RatingRow | null {
@@ -235,7 +304,7 @@ function ratingOf(v: unknown): RatingRow | null {
   return {
     model,
     provider,
-    rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
+    rating_milli: numberOrNull(v.rating_milli) ?? 0,
     context_length: numberOrNull(v.context_length),
     tools: v.tools === true,
     vision: v.vision === true,
@@ -249,6 +318,7 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
   const id = stringOf(v.id);
   if (id === '') return null;
   const requires = isRecord(v.requires) ? v.requires : {};
+  const minContext = numberOrNull(requires.min_context);
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
@@ -258,60 +328,74 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
       tools: requires.tools === true,
       vision: requires.vision === true,
       json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+      ...(minContext !== null ? { min_context: minContext } : {}),
     },
+  };
+}
+
+function documentWith(schema: string, documents: readonly Json[], predicate: DocumentPredicate): Json | null {
+  return documents.find((document) => document.schema === schema && predicate(document)) ?? null;
+}
+
+function parseDirectory(document: Json): ProviderDirectoryEntry[] {
+  return collect(listOf(document.providers), providerOf);
+}
+
+function parseBest(value: unknown): { id: string; rating_milli: number }[] {
+  return collect(listOf(value), (item) => {
+    if (!isRecord(item) || !hasString(item.id)) return null;
+    return { id: item.id, rating_milli: numberOrNull(item.rating_milli) ?? 0 };
+  });
+}
+
+function parseRatings(document: Json | null): RatingsFile | null {
+  if (document === null) return null;
+  return {
+    schema: RATINGS_SCHEMA,
+    ratings: collect(listOf(document.ratings), ratingOf),
+    best: parseBest(document.best),
+  };
+}
+
+function parseWorkload(document: Json | null): WorkloadFile | null {
+  if (document === null) return null;
+  return {
+    schema: WORKLOAD_SCHEMA,
+    manifest: collect(listOf(document.manifest), workloadRequestOf),
+  };
+}
+
+function emptyBrief(error: string): Brief {
+  return {
+    directory: { schema: PROVIDERS_SCHEMA, providers: [] },
+    ratings: null,
+    workload: null,
+    error,
   };
 }
 
 /** The brief at `path`, its three documents found by schema. */
 export function readBrief(path: string): Brief {
-  const directory: ProviderDirectory = { schema: PROVIDERS_SCHEMA, providers: [] };
-  if (path === '') return { directory, ratings: null, workload: null, error: 'MAKEFUN_PROMPT_FILE is not set' };
+  if (path === '') return emptyBrief('MAKEFUN_PROMPT_FILE is not set');
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
+    return emptyBrief(`cannot read ${path}: ${(err as Error).message}`);
   }
   const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
-    return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
+  const directoryDoc = documentWith(PROVIDERS_SCHEMA, docs, (document) => Array.isArray(document.providers));
+  if (directoryDoc === null) {
+    return emptyBrief(`the brief at ${path} holds no ${PROVIDERS_SCHEMA} document`);
   }
-  const providers = directoryDoc.providers.flatMap((v) => {
-    const p = providerOf(v);
-    return p === null ? [] : [p];
-  });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
-      ? null
-      : {
-          schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
-          }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-              })
-            : [],
-        };
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
-      ? null
-      : {
-          schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
-          }),
-        };
-  return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
+  const ratingsDoc = documentWith(RATINGS_SCHEMA, docs, (document) => Array.isArray(document.ratings));
+  const workloadDoc = documentWith(WORKLOAD_SCHEMA, docs, (document) => Array.isArray(document.manifest));
+  return {
+    directory: { schema: PROVIDERS_SCHEMA, providers: parseDirectory(directoryDoc) },
+    ratings: parseRatings(ratingsDoc),
+    workload: parseWorkload(workloadDoc),
+    error: null,
+  };
 }
 
 /** The rating row of one provider's model, when the quality table has one. */
@@ -382,26 +466,42 @@ function modelIn(wire: Wire, v: unknown): ProbedModel | null {
 function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
   if (!isRecord(body)) return [];
   const list = wire === 'gemini' ? body.models : body.data;
-  if (!Array.isArray(list)) return [];
-  return list.flatMap((v) => {
-    const m = modelIn(wire, v);
-    return m === null ? [] : [m];
-  });
+  return collect(listOf(list), (value) => modelIn(wire, value));
+}
+
+function catalogPath(wire: Wire): string {
+  return wire === 'gemini' ? '/v1beta/models' : '/v1/models';
+}
+
+function probeHeaders(provider: ProviderDirectoryEntry): Record<string, string> {
+  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
+}
+
+function failedProbe(provider: ProviderDirectoryEntry, status: number, error: string): Probe {
+  return { provider, ok: false, status, models: [], error };
+}
+
+function stableModels(models: readonly ProbedModel[]): ProbedModel[] {
+  const unique = new Map<string, ProbedModel>();
+  for (const model of [...models].sort((a, b) => a.id.localeCompare(b.id))) {
+    if (!unique.has(model.id)) unique.set(model.id, model);
+  }
+  return [...unique.values()];
 }
 
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
   const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  const url = `${base}${catalogPath(provider.wire)}`;
   try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
+    const res = await fetch(url, { headers: probeHeaders(provider), signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return failedProbe(provider, res.status, `GET ${url} answered HTTP ${res.status}`);
     const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
+    return { provider, ok: true, status: res.status, models: stableModels(modelsIn(provider.wire, body)), error: null };
   } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+    return failedProbe(provider, 0, `GET ${url} failed: ${(err as Error).message}`);
   }
 }
 
@@ -415,18 +515,20 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
  * joined URL does; the joined URL reaches a provider, the path names it.
  */
 export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
-    }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
-  }
-  return { providers };
+  return {
+    providers: probes.filter((probe) => probe.ok).map((probe) => ({
+      id: probe.provider.id,
+      base_url: probe.provider.base,
+      key_env: probe.provider.key_env,
+      wire: probe.provider.wire,
+      models: stableModels(probe.models).map((model) => {
+        const row = ratingOfModel(ratings, probe.provider.id, model.id);
+        return {
+          id: model.id,
+          free: modelFree(model, row),
+          context_length: row?.context_length ?? model.context_length ?? null,
+        };
+      }),
+    })),
+  };
 }

@@ -156,6 +156,42 @@ interface Candidate {
   key: string;
 }
 
+interface RequestShape {
+  api: 'openai' | 'anthropic';
+  body: Json;
+  requires: Requirement;
+  stream: boolean;
+  jsonMode: boolean;
+}
+
+function candidateKey(provider: ProviderDirectoryEntry, model: ProbedModel): string {
+  return `${provider.id}/${model.id}`;
+}
+
+function jsonModeOf(body: Json): boolean {
+  return isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
+}
+
+function requestHasImage(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => isRecord(block) && (block.type === 'image_url' || block.type === 'image'));
+}
+
+function normalizeRequest(api: 'openai' | 'anthropic', body: Json, requires: Requirement): RequestShape {
+  return { api, body, requires, stream: body.stream === true, jsonMode: api === 'openai' && jsonModeOf(body) };
+}
+
+function candidateFor(probe: Probe, order: number, model: ProbedModel): Candidate {
+  const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+  return {
+    provider: probe.provider,
+    order,
+    model,
+    rating: row?.rating_milli ?? 0,
+    key: candidateKey(probe.provider, model),
+  };
+}
+
 /** This trial's live provider state: successes served, refusal strikes, and a retirement flag. */
 const successes = new Map<string, number>();
 const refusals = new Map<string, number>();
@@ -179,13 +215,7 @@ function eligible(requires: Requirement, restrictAnthropicWire: boolean): Candid
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      out.push({
-        provider: probe.provider,
-        order: index,
-        model,
-        rating: row?.rating_milli ?? 0,
-        key: `${probe.provider.id}/${model.id}`,
-      });
+      out.push(candidateFor(probe, index, model));
     }
   }
   return out;
@@ -230,20 +260,11 @@ function buildPlan(): void {
 
 /** Requirements read off a request body, when the manifest has no row for it. */
 function requirementsFromBody(api: 'openai' | 'anthropic', body: Json): Requirement {
-  const vision = (content: unknown): boolean => {
-    if (!Array.isArray(content)) return false;
-    const wantsImage = (block: unknown): boolean => {
-      if (!isRecord(block)) return false;
-      if (block.type === 'image_url' || block.type === 'image') return true;
-      return false;
-    };
-    return content.some(wantsImage);
-  };
   const messages = Array.isArray(body.messages) ? body.messages : [];
   return {
     tools: Array.isArray(body.tools) && body.tools.length > 0,
-    vision: messages.some((raw) => isRecord(raw) && raw.role === 'user' && vision(raw.content)),
-    json: api === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema'),
+    vision: messages.some((raw) => isRecord(raw) && raw.role === 'user' && requestHasImage(raw.content)),
+    json: api === 'openai' && jsonModeOf(body),
   };
 }
 
@@ -281,31 +302,53 @@ function pickCandidate(ranked: readonly Candidate[], tried: ReadonlyMap<string, 
 
 // ---------------------------------------------------------------- the provider call
 
-/** One inference call, in the routed provider's own wire. */
-function providerRequest(cand: Candidate, api: 'openai' | 'anthropic', body: Json): { url: string; headers: Record<string, string>; bodyText: string } {
-  const provider = cand.provider;
-  const base = joinBase(ENV_URL, provider.base);
-  const headers: Record<string, string> = {
+interface ProviderRequest {
+  url: string;
+  headers: Record<string, string>;
+  bodyText: string;
+}
+
+function requestHeaders(provider: ProviderDirectoryEntry): Record<string, string> {
+  return {
     'content-type': 'application/json',
     accept: 'application/json, text/event-stream',
     ...authHeaders(provider.auth, provider.key),
   };
-  let url: string;
-  let json: Json;
+}
+
+function providerPath(provider: ProviderDirectoryEntry, api: 'openai' | 'anthropic', stream: boolean, model: string): string {
+  const base = joinBase(ENV_URL, provider.base);
+  if (provider.wire === 'openai') return `${base}/v1/chat/completions`;
+  if (provider.wire === 'anthropic') return `${base}/v1/messages`;
+  const verb = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+  return `${base}/v1beta/models/${encodeURIComponent(model)}:${verb}`;
+}
+
+function providerPayload(cand: Candidate, api: 'openai' | 'anthropic', request: RequestShape): Json {
+  const provider = cand.provider;
+  const model = cand.model.id;
   if (provider.wire === 'openai') {
-    url = `${base}/v1/chat/completions`;
-    json = api === 'openai' ? { ...body, model: cand.model.id } : anthropicToOpenAI(body, cand.model.id);
+    const json = request.api === 'openai' ? { ...request.body, model } : anthropicToOpenAI(request.body, model);
     if (json.stream === true) json.stream_options = { include_usage: true };
-  } else if (provider.wire === 'anthropic') {
-    url = `${base}/v1/messages`;
-    headers['anthropic-version'] = '2023-06-01';
-    json = api === 'anthropic' ? { ...body, model: cand.model.id } : openAIToAnthropic(body, cand.model.id);
-  } else {
-    const verb = body.stream === true ? 'streamGenerateContent?alt=sse' : 'generateContent';
-    url = `${base}/v1beta/models/${encodeURIComponent(cand.model.id)}:${verb}`;
-    json = api === 'openai' ? openAIToGemini(body) : anthropicToGemini(body);
+    return json;
   }
-  return { url, headers, bodyText: JSON.stringify(json) };
+  if (provider.wire === 'anthropic') {
+    return request.api === 'anthropic' ? { ...request.body, model } : openAIToAnthropic(request.body, model);
+  }
+  return request.api === 'openai' ? openAIToGemini(request.body) : anthropicToGemini(request.body);
+}
+
+/** One inference call, in the routed provider's own wire. */
+function providerRequest(cand: Candidate, api: 'openai' | 'anthropic', body: Json): ProviderRequest {
+  const request = normalizeRequest(api, body, requirementsFromBody(api, body));
+  const headers = requestHeaders(cand.provider);
+  if (cand.provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  const json = providerPayload(cand, api, request);
+  return {
+    url: providerPath(cand.provider, api, request.stream, cand.model.id),
+    headers,
+    bodyText: JSON.stringify(json),
+  };
 }
 
 /** Release a refused answer's body without reading it as an error. */
@@ -314,6 +357,37 @@ async function drain(upstream: Response): Promise<void> {
     await upstream.arrayBuffer();
   } catch {
     // The provider is unreachable or the body is gone: nothing to release.
+  }
+}
+
+type UpstreamDecision = 'retry' | 'client_error' | 'success';
+
+function classifyUpstream(status: number): UpstreamDecision {
+  if (status === 402 || status === 429 || status >= 500) return 'retry';
+  if (status < 200 || status >= 300) return 'client_error';
+  return 'success';
+}
+
+function markRefusal(cand: Candidate, refusedHere: Set<string>): void {
+  refusals.set(cand.provider.id, (refusals.get(cand.provider.id) ?? 0) + 1);
+  refusedHere.add(cand.provider.id);
+}
+
+function markSuccess(cand: Candidate): void {
+  successes.set(cand.provider.id, (successes.get(cand.provider.id) ?? 0) + 1);
+}
+
+async function callProvider(cand: Candidate, api: 'openai' | 'anthropic', body: Json): Promise<Response | null> {
+  const request = providerRequest(cand, api, body);
+  try {
+    return await fetch(request.url, {
+      method: 'POST',
+      headers: request.headers,
+      body: request.bodyText,
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+  } catch {
+    return null;
   }
 }
 
@@ -418,17 +492,33 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    const buffer = requestChunk(chunk);
     size += buffer.length;
     if (size > MAX_BODY_BYTES) return null;
     chunks.push(buffer);
   }
+  return parseJsonObject(Buffer.concat(chunks));
+}
+
+function requestChunk(chunk: unknown): Buffer {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+}
+
+function parseJsonObject(bytes: Buffer): Json | null {
   try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const value: unknown = JSON.parse(bytes.toString('utf8'));
     return isRecord(value) ? value : null;
   } catch {
     return null;
   }
+}
+
+function clientWireFor(pathname: string): 'openai' | 'anthropic' {
+  return pathname === '/v1/messages' ? 'anthropic' : 'openai';
+}
+
+function isRoute(method: string | undefined, actual: string | undefined, expectedMethod: string, expectedPath: string): boolean {
+  return method === expectedMethod && actual === expectedPath;
 }
 
 /** POST /v1/chat/completions and POST /v1/messages: route, call, fail over, answer in the client's wire. */
@@ -446,26 +536,21 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
     tried.set(cand.key, (tried.get(cand.key) ?? 0) + 1);
     attempted.push(cand.key);
     log(`slot ${slot.index} attempt ${attempt + 1}: ${cand.key}`);
-    const { url, headers, bodyText } = providerRequest(cand, api, body);
-    let upstream: Response;
-    try {
-      upstream = await fetch(url, { method: 'POST', headers, body: bodyText, signal: AbortSignal.timeout(CALL_TIMEOUT_MS) });
-    } catch {
-      continue;
-    }
-    if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
-      refusals.set(cand.provider.id, (refusals.get(cand.provider.id) ?? 0) + 1);
-      refusedHere.add(cand.provider.id);
+    const upstream = await callProvider(cand, api, body);
+    if (upstream === null) continue;
+    const decision = classifyUpstream(upstream.status);
+    if (decision === 'retry') {
+      markRefusal(cand, refusedHere);
       log(`refused by ${cand.key} with ${upstream.status}`);
       await drain(upstream);
       continue;
     }
-    if (upstream.status < 200 || upstream.status >= 300) {
+    if (decision === 'client_error') {
       log(`client error from ${cand.key}: ${upstream.status}`);
       await drain(upstream);
       continue;
     }
-    successes.set(cand.provider.id, (successes.get(cand.provider.id) ?? 0) + 1);
+    markSuccess(cand);
     await relay(cand, api, body, upstream, res);
     return;
   }
@@ -483,23 +568,23 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
-  if (req.method === 'GET' && url.pathname === '/v1/models') {
+  if (isRoute(req.method, url.pathname, 'GET', '/v1/models')) {
     models(req, res);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+  if (isRoute(req.method, url.pathname, 'POST', '/v1/chat/completions')) {
     const body = await readJson(req);
     if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
     await serve('openai', body, res);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/messages') {
+  if (isRoute(req.method, url.pathname, 'POST', '/v1/messages')) {
     const body = await readJson(req);
     if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
     await serve('anthropic', body, res);
     return;
   }
-  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+  sendError(res, clientWireFor(url.pathname), 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
 }
 
 // ---------------------------------------------------------------- startup
@@ -513,22 +598,40 @@ function listen(server: Server): Promise<void> {
 
 /** POST /register with the port and the one catalog; the env answers with the workload's size. */
 async function register(port: number, report: CatalogReport): Promise<void> {
+  const request = { protocol_version: PROTOCOL_VERSION, port, catalog: report };
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch(`${ENV_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+        body: JSON.stringify(request),
         signal: AbortSignal.timeout(5000),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-      const reply: unknown = await res.json();
-      if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
+      await acceptRegistration(res);
       return;
     } catch (err) {
       if (attempt === 4) throw err;
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
     }
+  }
+}
+
+async function acceptRegistration(res: Response): Promise<void> {
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  const reply: unknown = await res.json();
+  if (isRecord(reply) && typeof reply.requests === 'number') {
+    log(`registered: the workload holds ${reply.requests} requests`);
+  }
+}
+
+async function workIsDone(): Promise<boolean> {
+  try {
+    const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
+    if (res.status !== 200) return false;
+    const work: unknown = await res.json();
+    return isRecord(work) && work.done === true;
+  } catch {
+    return false;
   }
 }
 
@@ -540,10 +643,7 @@ function poll(server: Server): void {
     inFlight = true;
     void (async () => {
       try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
+        if (await workIsDone()) {
           clearInterval(timer);
           server.close();
           process.exit(0);
